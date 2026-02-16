@@ -36,9 +36,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/i3x/i3x-python"
-Documentation = "https://github.com/i3x/i3x-python#readme"
-Issues = "https://github.com/i3x/i3x-python/issues"
+Homepage = "https://github.com/cesmii/python-i3x-client"
+Documentation = "https://github.com/cesmii/python-i3x-client#readme"
+Issues = "https://github.com/cesmii/python-i3x-client/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/i3x"]
