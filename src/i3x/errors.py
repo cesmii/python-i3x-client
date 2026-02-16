@@ -10,7 +10,7 @@ class I3XError(Exception):
 
 
 class ConnectionError(I3XError):
-    """Failed to connect to the CMIP server."""
+    """Failed to connect to the i3X server."""
 
 
 class AuthenticationError(I3XError):

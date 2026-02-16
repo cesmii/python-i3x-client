@@ -1,4 +1,4 @@
-"""Frozen dataclasses representing I3X/CMIP data models."""
+"""Frozen dataclasses representing i3X data models."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ class RelationshipType:
 
 @dataclass(frozen=True)
 class ObjectInstance:
-    """An object instance in the CMIP system."""
+    """An object instance in the i3X system."""
 
     element_id: str
     display_name: str

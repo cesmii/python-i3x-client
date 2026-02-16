@@ -1,6 +1,6 @@
 # i3x-client
 
-Python client library for I3X CMIP servers.
+Python client library for i3X servers.
 
 ## Installation
 
@@ -19,7 +19,7 @@ pip install -e ".[dev]"
 ```python
 import i3x
 
-# Connect to a CMIP server
+# Connect to an i3X server
 client = i3x.Client("http://localhost:8080")
 client.connect()
 

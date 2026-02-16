@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "i3x-client"
-version = "0.1.0"
-description = "Python client library for I3X CMIP servers"
+version = "0.1.6"
+description = "Python client library for i3X servers"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
-    { name = "I3X Working Group" },
+    { name = "CESMII" },
 ]
-keywords = ["i3x", "cmip", "iot", "building-automation", "client"]
+keywords = ["i3x", "iiot", "building-automation", "client"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

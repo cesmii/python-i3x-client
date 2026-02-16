@@ -1,6 +1,6 @@
-"""i3x - Python client library for I3X CMIP servers."""
+"""i3x - Python client library for I3X servers."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.6"
 
 from .client import Client
 from .errors import (

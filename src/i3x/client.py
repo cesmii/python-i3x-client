@@ -1,4 +1,4 @@
-"""Main Client class for interacting with I3X CMIP servers."""
+"""Main Client class for interacting with i3X servers."""
 
 from __future__ import annotations
 
@@ -30,18 +30,18 @@ logger = logging.getLogger("i3x")
 
 
 class Client:
-    """High-level client for I3X CMIP servers.
+    """High-level client for i3X servers.
 
     Usage::
 
-        client = i3x.Client("https://cmip.example.com")
+        client = i3x.Client("https://i3x.example.com")
         client.connect()
         namespaces = client.get_namespaces()
         client.disconnect()
 
     Or as a context manager::
 
-        with i3x.Client("https://cmip.example.com") as client:
+        with i3x.Client("https://i3x.example.com") as client:
             namespaces = client.get_namespaces()
     """
 
@@ -68,7 +68,7 @@ class Client:
         return self._transport.is_open
 
     def connect(self) -> None:
-        """Connect to the CMIP server."""
+        """Connect to the i3X server."""
         self._transport.open()
         self._sub_manager = SubscriptionManager(
             transport=self._transport,
@@ -79,7 +79,7 @@ class Client:
             self.on_connect(self)
 
     def disconnect(self) -> None:
-        """Disconnect from the CMIP server and stop all subscriptions."""
+        """Disconnect from the i3X server and stop all subscriptions."""
         if self._sub_manager:
             self._sub_manager.stop_all()
             self._sub_manager = None
