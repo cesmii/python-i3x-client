@@ -1,6 +1,6 @@
 """i3x - Python client library for i3X servers."""
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .client import Client
 from .errors import (
