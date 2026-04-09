@@ -39,7 +39,7 @@ class Transport:
         return self._client is not None
 
     def open(self) -> None:
-        """Open the underlying HTTP client and verify connectivity."""
+        """Open the underlying HTTP client and verify connectivity via GET /info."""
         if self._client is not None:
             return
         headers = {}
@@ -52,9 +52,8 @@ class Transport:
             headers=headers,
             timeout=self._timeout,
         )
-        # Verify connectivity with a lightweight request
         try:
-            self.get("/namespaces")
+            self.get("/info")
         except Exception:
             self.close()
             raise
@@ -82,19 +81,15 @@ class Transport:
         client = self._ensure_open()
         return self._request(client, "PUT", path, json=json)
 
-    def delete(self, path: str) -> Any:
-        client = self._ensure_open()
-        return self._request(client, "DELETE", path)
-
-    def stream_get(self, path: str) -> httpx.Response:
-        """Return a streaming response for SSE endpoints.
+    def stream_post(self, path: str, json: Any = None) -> httpx.Response:
+        """Return a streaming response for SSE endpoints (POST-based).
 
         Caller is responsible for closing the response.
         """
         client = self._ensure_open()
         try:
             response = client.send(
-                client.build_request("GET", path),
+                client.build_request("POST", path, json=json),
                 stream=True,
             )
             self._check_status(response)
@@ -126,9 +121,21 @@ class Transport:
         if response.status_code == 204:
             return None
         content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return response.json()
-        return response.text
+        if "application/json" not in content_type:
+            return response.text
+
+        body = response.json()
+
+        # Unwrap the standard i3X response envelope.
+        # Simple success: {"success": true, "result": <data>}  → return result
+        # Bulk response:  {"success": bool, "results": [...]}  → return results list
+        if isinstance(body, dict):
+            if "result" in body:
+                return body["result"]
+            if "results" in body:
+                return body["results"]
+
+        return body
 
     @staticmethod
     def _check_status(response: httpx.Response) -> None:
@@ -142,7 +149,12 @@ class Transport:
                 error_cls = errors.I3XError
         try:
             detail = response.json()
-            message = detail.get("detail", detail.get("message", response.text))
+            # New envelope: {"success": false, "error": {"code": N, "message": "..."}}
+            error_obj = detail.get("error") if isinstance(detail, dict) else None
+            if isinstance(error_obj, dict):
+                message = error_obj.get("message", response.text)
+            else:
+                message = detail.get("detail", detail.get("message", response.text))
         except Exception:
             message = response.text
         raise error_cls(str(message), status_code=response.status_code)

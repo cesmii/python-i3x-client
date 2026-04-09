@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable
 
-from .models import Subscription, ValueChange
+from .models import ValueChange
 from ._sse import SSEStream
 
 if TYPE_CHECKING:
@@ -20,10 +20,12 @@ class SubscriptionManager:
     def __init__(
         self,
         transport: Transport,
+        client_id: str | None,
         on_event: Callable[[list[ValueChange]], None],
         on_error: Callable[[Exception], None],
     ):
         self._transport = transport
+        self._client_id = client_id
         self._on_event = on_event
         self._on_error = on_error
         self._streams: dict[str, SSEStream] = {}
@@ -34,6 +36,7 @@ class SubscriptionManager:
             return
         stream = SSEStream(
             transport=self._transport,
+            client_id=self._client_id,
             subscription_id=subscription_id,
             on_event=self._on_event,
             on_error=self._on_error,

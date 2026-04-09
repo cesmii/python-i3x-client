@@ -1,6 +1,6 @@
-"""i3x - Python client library for I3X servers."""
+"""i3x - Python client library for i3X servers."""
 
-__version__ = "0.1.6"
+__version__ = "0.5.0"
 
 from .client import Client
 from .errors import (
@@ -14,12 +14,17 @@ from .errors import (
     TimeoutError,
 )
 from .models import (
-    LastKnownValue,
+    CurrentValue,
+    HistoricalValue,
     Namespace,
     ObjectInstance,
+    ObjectInstanceMetadata,
     ObjectType,
+    RelatedObject,
     RelationshipType,
+    ServerInfo,
     Subscription,
+    SyncUpdate,
     ValueChange,
     VQT,
 )
@@ -37,12 +42,17 @@ __all__ = [
     "SubscriptionError",
     "StreamError",
     # Models
+    "ServerInfo",
     "Namespace",
     "ObjectType",
     "RelationshipType",
     "ObjectInstance",
-    "LastKnownValue",
-    "ValueChange",
-    "Subscription",
+    "ObjectInstanceMetadata",
+    "RelatedObject",
     "VQT",
+    "CurrentValue",
+    "HistoricalValue",
+    "ValueChange",
+    "SyncUpdate",
+    "Subscription",
 ]

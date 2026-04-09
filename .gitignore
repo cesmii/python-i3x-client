@@ -1,5 +1,6 @@
 # Virtual environments
 .venv/
+.venv2/
 venv/
 
 # Build artifacts
