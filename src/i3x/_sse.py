@@ -8,6 +8,7 @@ import threading
 from typing import TYPE_CHECKING, Any, Callable
 
 import httpx
+from httpx_sse import EventSource
 
 from . import errors
 from .models import ValueChange
@@ -17,12 +18,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("i3x.sse")
 
+_INITIAL_BACKOFF = 1.0
+_MAX_BACKOFF = 30.0
+
 
 class SSEStream:
     """Manages an SSE connection to a subscription stream in a background thread.
 
     The stream endpoint is POST /subscriptions/stream, which accepts
-    {clientId, subscriptionId} and returns an SSE response.
+    {clientId, subscriptionId} and returns an SSE response. If the stream
+    drops, the thread reconnects with exponential backoff until stop() is
+    called or the server reports a non-retryable error (subscription gone,
+    auth rejected, streaming unsupported).
     """
 
     def __init__(
@@ -40,6 +47,8 @@ class SSEStream:
         self._on_error = on_error
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._response: httpx.Response | None = None
+        self._dispatched_events = False
 
     @property
     def is_running(self) -> bool:
@@ -60,55 +69,78 @@ class SSEStream:
     def stop(self) -> None:
         """Signal the background thread to stop and wait for it."""
         self._stop_event.set()
+        # Close the in-flight response to unblock a thread waiting on the
+        # next SSE chunk (the read timeout is disabled for streams).
+        response = self._response
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=5.0)
             self._thread = None
 
     def _run(self) -> None:
-        """Background thread entry point."""
+        """Background thread entry point: connect, read, reconnect on failure."""
         body: dict[str, Any] = {"subscriptionId": self._subscription_id}
         if self._client_id is not None:
             body["clientId"] = self._client_id
-        try:
-            response = self._transport.stream_post("/subscriptions/stream", json=body)
-        except Exception as exc:
-            self._on_error(errors.StreamError(f"Failed to open SSE stream: {exc}"))
-            return
+        backoff = _INITIAL_BACKOFF
 
-        try:
-            self._read_events(response)
-        except Exception as exc:
-            if not self._stop_event.is_set():
+        while not self._stop_event.is_set():
+            try:
+                response = self._transport.stream_post("/subscriptions/stream", json=body)
+            except (
+                errors.NotFoundError,
+                errors.AuthenticationError,
+                errors.NotSupportedError,
+            ) as exc:
+                self._on_error(errors.StreamError(f"Cannot open SSE stream: {exc}"))
+                return
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    return
+                self._on_error(errors.StreamError(f"Failed to open SSE stream: {exc}"))
+                if self._stop_event.wait(backoff):
+                    return
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+                continue
+
+            self._response = response
+            self._dispatched_events = False
+            try:
+                self._read_events(response)
+                return  # Server ended the stream cleanly.
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    return
                 self._on_error(errors.StreamError(f"SSE stream error: {exc}"))
-        finally:
-            response.close()
+            finally:
+                self._response = None
+                response.close()
+
+            if self._dispatched_events:
+                backoff = _INITIAL_BACKOFF
+            if self._stop_event.wait(backoff):
+                return
+            backoff = min(backoff * 2, _MAX_BACKOFF)
 
     def _read_events(self, response: httpx.Response) -> None:
-        """Read SSE events from the response stream."""
-        buffer = ""
-        for chunk in response.iter_text():
+        """Read SSE events from the response stream until it ends."""
+        for sse in EventSource(response).iter_sse():
             if self._stop_event.is_set():
                 return
-            buffer += chunk
-            while "\n\n" in buffer:
-                event_text, buffer = buffer.split("\n\n", 1)
-                self._process_event_text(event_text)
+            self._process_data(sse.data)
 
-    def _process_event_text(self, event_text: str) -> None:
-        """Parse and dispatch a single SSE event.
+    def _process_data(self, data_str: str) -> None:
+        """Parse and dispatch a single SSE event payload.
 
         The stream sends arrays of value change objects:
           data: [{"elementId": "...", "value": ..., "quality": "...", "timestamp": "..."}]
         """
-        data_lines = []
-        for line in event_text.split("\n"):
-            if line.startswith("data:"):
-                data_lines.append(line[5:].strip())
-
-        if not data_lines:
+        if not data_str:
             return
-
-        data_str = "\n".join(data_lines)
         try:
             parsed = json.loads(data_str)
         except json.JSONDecodeError:
@@ -118,8 +150,9 @@ class SSEStream:
         if isinstance(parsed, list):
             changes = [ValueChange.from_dict(item) for item in parsed if isinstance(item, dict)]
             if changes:
+                self._dispatched_events = True
                 self._on_event(changes)
         elif isinstance(parsed, dict):
             # Single-item event
-            change = ValueChange.from_dict(parsed)
-            self._on_event([change])
+            self._dispatched_events = True
+            self._on_event([ValueChange.from_dict(parsed)])

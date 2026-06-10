@@ -1,6 +1,6 @@
 """i3x - Python client library for i3X servers."""
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 from .client import Client
 from .errors import (
@@ -8,10 +8,12 @@ from .errors import (
     ConnectionError,
     I3XError,
     NotFoundError,
+    NotSupportedError,
     ServerError,
     StreamError,
     SubscriptionError,
     TimeoutError,
+    UnsupportedVersionError,
 )
 from .models import (
     CurrentValue,
@@ -24,7 +26,7 @@ from .models import (
     RelationshipType,
     ServerInfo,
     Subscription,
-    SyncUpdate,
+    SyncBatch,
     ValueChange,
     VQT,
 )
@@ -37,10 +39,12 @@ __all__ = [
     "ConnectionError",
     "AuthenticationError",
     "NotFoundError",
+    "NotSupportedError",
     "ServerError",
     "TimeoutError",
     "SubscriptionError",
     "StreamError",
+    "UnsupportedVersionError",
     # Models
     "ServerInfo",
     "Namespace",
@@ -53,6 +57,6 @@ __all__ = [
     "CurrentValue",
     "HistoricalValue",
     "ValueChange",
-    "SyncUpdate",
+    "SyncBatch",
     "Subscription",
 ]

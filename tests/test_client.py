@@ -4,7 +4,7 @@ import pytest
 import respx
 
 import i3x
-from i3x.errors import NotFoundError
+from i3x.errors import NotFoundError, NotSupportedError, UnsupportedVersionError
 
 from .conftest import (
     SAMPLE_DELETE_BULK,
@@ -24,6 +24,9 @@ from .conftest import (
     SAMPLE_SUBSCRIPTION_LIST,
     SAMPLE_SYNC_RESPONSE,
     SAMPLE_VALUE_BULK,
+    bulk,
+    bulk_item_err,
+    bulk_item_ok,
     success,
 )
 
@@ -31,6 +34,7 @@ from .conftest import (
 @pytest.fixture()
 def mock_api():
     with respx.mock(base_url="http://test-server:8080") as router:
+        # Connectivity check and version detection during connect() use GET /info
         router.get("/info").respond(json=SAMPLE_SERVER_INFO)
         yield router
 
@@ -85,6 +89,51 @@ class TestClientLifecycle:
         assert c.client_id == "my-client"
         c.connect()
         c.disconnect()
+
+
+class TestClientVersionDetection:
+    def test_alpha_server_raises(self):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(status_code=404)
+            c = i3x.Client("http://test-server:8080")
+            with pytest.raises(UnsupportedVersionError, match="/info"):
+                c.connect()
+
+    @pytest.mark.parametrize("spec_version", ["1.0-beta", "0.9", "beta"])
+    def test_pre_release_server_warns(self, spec_version):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(json=success({
+                "specVersion": spec_version,
+                "capabilities": {},
+            }))
+            c = i3x.Client("http://test-server:8080")
+            with pytest.warns(DeprecationWarning, match="beta"):
+                c.connect()
+            c.disconnect()
+
+    def test_missing_spec_version_warns(self):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(json=success({"capabilities": {}}))
+            c = i3x.Client("http://test-server:8080")
+            with pytest.warns(DeprecationWarning):
+                c.connect()
+            c.disconnect()
+
+    def test_v1_server_no_warning(self, mock_api, recwarn):
+        c = i3x.Client("http://test-server:8080")
+        c.connect()
+        dep_warnings = [w for w in recwarn.list if issubclass(w.category, DeprecationWarning)]
+        assert dep_warnings == []
+        c.disconnect()
+
+    def test_server_info_captured_on_connect(self, mock_api):
+        c = i3x.Client("http://test-server:8080")
+        assert c.server_info is None
+        c.connect()
+        assert c.server_info is not None
+        assert c.server_info.spec_version == "1.0"
+        c.disconnect()
+        assert c.server_info is None
 
 
 class TestClientServerInfo:
@@ -159,11 +208,10 @@ class TestClientExploratory:
         assert obj.type_element_id == "type-1"
 
     def test_get_object_not_found(self, mock_api, client):
-        mock_api.post("/objects/list").respond(json={
-            "success": False,
-            "results": [{"success": False, "elementId": "nonexistent", "error": {"code": 404, "message": "Not found"}}],
-        })
-        with pytest.raises(NotFoundError):
+        mock_api.post("/objects/list").respond(json=bulk([
+            bulk_item_err("nonexistent", 404, "Element not found: nonexistent", title="Not Found"),
+        ]))
+        with pytest.raises(NotFoundError, match="Element not found: nonexistent"):
             client.get_object("nonexistent")
 
     def test_list_objects(self, mock_api, client):
@@ -196,10 +244,9 @@ class TestClientValues:
         assert val.components is None
 
     def test_get_value_not_found(self, mock_api, client):
-        mock_api.post("/objects/value").respond(json={
-            "success": False,
-            "results": [{"success": False, "elementId": "nonexistent", "error": {"code": 404, "message": "Not found"}}],
-        })
+        mock_api.post("/objects/value").respond(json=bulk([
+            bulk_item_err("nonexistent", 404, "Element not found: nonexistent", title="Not Found"),
+        ]))
         with pytest.raises(NotFoundError):
             client.get_value("nonexistent")
 
@@ -240,22 +287,75 @@ class TestClientValues:
         assert history.is_composition is False
 
     def test_get_history_not_found(self, mock_api, client):
-        mock_api.post("/objects/history").respond(json={
-            "success": False,
-            "results": [{"success": False, "elementId": "nonexistent", "error": {"code": 404, "message": "Not found"}}],
-        })
+        mock_api.post("/objects/history").respond(json=bulk([
+            bulk_item_err("nonexistent", 404, "Element not found: nonexistent", title="Not Found"),
+        ]))
         with pytest.raises(NotFoundError):
             client.get_history("nonexistent")
 
 
 class TestClientUpdates:
-    def test_update_value(self, mock_api, client):
-        mock_api.put("/objects/obj-1/value").respond(json=success(None))
+    def test_update_value_with_vqt_dict(self, mock_api, client):
+        route = mock_api.put("/objects/value").respond(json=bulk([bulk_item_ok("obj-1", None)]))
         client.update_value("obj-1", {"value": 75.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"})
+        import json
+        payload = json.loads(route.calls.last.request.content)
+        assert payload == {"updates": [{
+            "elementId": "obj-1",
+            "value": {"value": 75.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"},
+        }]}
 
-    def test_update_value_url_encodes(self, mock_api, client):
-        mock_api.put("/objects/obj%2F1/value").respond(json=success(None))
-        client.update_value("obj/1", {"value": 75.0})
+    def test_update_value_with_raw_value(self, mock_api, client):
+        route = mock_api.put("/objects/value").respond(json=bulk([bulk_item_ok("obj-1", None)]))
+        client.update_value("obj-1", 75.0)
+        import json
+        payload = json.loads(route.calls.last.request.content)
+        assert payload == {"updates": [{"elementId": "obj-1", "value": {"value": 75.0}}]}
+
+    def test_update_value_failure_raises(self, mock_api, client):
+        mock_api.put("/objects/value").respond(json=bulk([
+            bulk_item_err("obj-x", 404, "Element not found: obj-x", title="Not Found"),
+        ]))
+        with pytest.raises(NotFoundError, match="Element not found: obj-x"):
+            client.update_value("obj-x", 75.0)
+
+    def test_update_values_bulk(self, mock_api, client):
+        route = mock_api.put("/objects/value").respond(json=bulk([
+            bulk_item_ok("obj-1", None),
+            bulk_item_ok("obj-2", None),
+        ]))
+        results = client.update_values({"obj-1": 75.0, "obj-2": {"value": 18.3, "quality": "Good"}})
+        assert len(results) == 2
+        assert all(item["success"] for item in results)
+        import json
+        payload = json.loads(route.calls.last.request.content)
+        assert payload == {"updates": [
+            {"elementId": "obj-1", "value": {"value": 75.0}},
+            {"elementId": "obj-2", "value": {"value": 18.3, "quality": "Good"}},
+        ]}
+
+    def test_update_history(self, mock_api, client):
+        route = mock_api.put("/objects/history").respond(json=bulk([bulk_item_ok("obj-1", None)]))
+        client.update_history("obj-1", [
+            {"value": 70.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"},
+            {"value": 72.5, "quality": "Good", "timestamp": "2026-01-01T01:00:00Z"},
+        ])
+        import json
+        payload = json.loads(route.calls.last.request.content)
+        assert [u["elementId"] for u in payload["updates"]] == ["obj-1", "obj-1"]
+        assert payload["updates"][0]["value"]["value"] == 70.0
+
+    def test_update_history_not_supported(self, mock_api, client):
+        mock_api.put("/objects/history").respond(status_code=501, json={
+            "success": False,
+            "responseDetail": {
+                "title": "Not Implemented",
+                "status": 501,
+                "detail": "This server does not support history updates",
+            },
+        })
+        with pytest.raises(NotSupportedError, match="history updates"):
+            client.update_history("obj-1", {"value": 70.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"})
 
 
 class TestClientSubscriptions:
@@ -293,10 +393,9 @@ class TestClientSubscriptions:
         assert len(sub.monitored_objects) == 1
 
     def test_get_subscription_not_found(self, mock_api, client):
-        mock_api.post("/subscriptions/list").respond(json={
-            "success": False,
-            "results": [{"success": False, "elementId": "sub-x", "error": {"code": 404, "message": "Not found"}}],
-        })
+        mock_api.post("/subscriptions/list").respond(json=bulk([
+            bulk_item_err("sub-x", 404, "Subscription not found: sub-x", title="Not Found"),
+        ]))
         with pytest.raises(NotFoundError):
             client.get_subscription("sub-x")
 
@@ -334,12 +433,18 @@ class TestClientSubscriptions:
 
     def test_sync_subscription(self, mock_api, client):
         mock_api.post("/subscriptions/sync").respond(json=SAMPLE_SYNC_RESPONSE)
-        updates = client.sync_subscription("sub-1")
-        assert len(updates) == 2
-        assert updates[0].sequence_number == 1
-        assert updates[0].element_id == "obj-1"
-        assert updates[0].value == 72.5
-        assert updates[1].sequence_number == 2
+        batches = client.sync_subscription("sub-1")
+        assert len(batches) == 2
+        assert batches[0].sequence_number == 1
+        assert len(batches[0].updates) == 1
+        assert batches[0].updates[0].element_id == "obj-1"
+        assert batches[0].updates[0].value == 72.5
+        assert batches[1].sequence_number == 2
+        assert len(batches[1].updates) == 2
+
+    def test_sync_subscription_empty(self, mock_api, client):
+        mock_api.post("/subscriptions/sync").respond(json=success([]))
+        assert client.sync_subscription("sub-1") == []
 
     def test_sync_subscription_with_last_sequence(self, mock_api, client):
         route = mock_api.post("/subscriptions/sync").respond(json=SAMPLE_SYNC_RESPONSE)
@@ -351,5 +456,5 @@ class TestClientSubscriptions:
     def test_sync_subscription_by_object(self, mock_api, client):
         mock_api.post("/subscriptions/sync").respond(json=SAMPLE_SYNC_RESPONSE)
         sub = i3x.Subscription(subscription_id="sub-1")
-        updates = client.sync_subscription(sub)
-        assert len(updates) == 2
+        batches = client.sync_subscription(sub)
+        assert len(batches) == 2

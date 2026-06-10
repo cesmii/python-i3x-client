@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import logging
 import uuid
+import warnings
 from typing import Any, Callable
-from urllib.parse import quote
+
+from . import errors
 
 from ._subscription import SubscriptionManager
 from ._transport import Transport
@@ -19,12 +21,35 @@ from .models import (
     RelationshipType,
     ServerInfo,
     Subscription,
-    SyncUpdate,
+    SyncBatch,
     ValueChange,
-    VQT,
 )
 
 logger = logging.getLogger("i3x")
+
+
+def _is_release_version(spec_version: str | None) -> bool:
+    """True if specVersion reports i3X 1.0 or later (not an alpha/beta pre-release)."""
+    if not spec_version:
+        return False
+    version = str(spec_version).strip().lower()
+    if "alpha" in version or "beta" in version:
+        return False
+    try:
+        major = int(version.split(".")[0])
+    except ValueError:
+        return False
+    return major >= 1
+
+
+def _item_error(item: dict[str, Any] | None, default_message: str) -> errors.I3XError:
+    """Build an error from a failed bulk-result item's responseDetail."""
+    detail = (item or {}).get("responseDetail")
+    if not isinstance(detail, dict):
+        detail = {}
+    status = detail.get("status", 404)
+    message = detail.get("detail") or detail.get("title") or default_message
+    return errors.for_status(status)(message, status_code=status)
 
 
 class Client:
@@ -32,15 +57,23 @@ class Client:
 
     Usage::
 
-        client = i3x.Client("https://i3x.example.com")
+        client = i3x.Client("https://i3x.example.com/v1")
         client.connect()
         namespaces = client.get_namespaces()
         client.disconnect()
 
     Or as a context manager::
 
-        with i3x.Client("https://i3x.example.com") as client:
+        with i3x.Client("https://i3x.example.com/v1") as client:
             namespaces = client.get_namespaces()
+
+    Note the i3X specification requires servers to expose the API under a
+    versioned path, so ``base_url`` normally ends in ``/v1``.
+
+    Authentication: the spec does not mandate a scheme, so pass whatever your
+    server requires — ``token`` for ``Authorization: Bearer``, ``auth`` for
+    anything httpx accepts (a ``(user, pass)`` tuple for HTTP Basic, or an
+    ``httpx.Auth`` instance), or ``headers`` for custom header schemes.
 
     A ``client_id`` is used to scope subscriptions to this client instance.
     If not provided, a UUID is generated automatically.
@@ -49,13 +82,19 @@ class Client:
     def __init__(
         self,
         base_url: str,
-        auth: tuple[str, str] | None = None,
+        auth: Any = None,
         timeout: float = 30.0,
         client_id: str | None = None,
+        token: str | None = None,
+        headers: dict[str, str] | None = None,
     ):
-        self._transport = Transport(base_url, auth=auth, timeout=timeout)
+        all_headers = dict(headers or {})
+        if token:
+            all_headers["Authorization"] = f"Bearer {token}"
+        self._transport = Transport(base_url, auth=auth, timeout=timeout, headers=all_headers)
         self._client_id = client_id or str(uuid.uuid4())
         self._sub_manager: SubscriptionManager | None = None
+        self._server_info: ServerInfo | None = None
 
         # Callbacks
         self.on_connect: Callable[[Client], None] | None = None
@@ -74,9 +113,47 @@ class Client:
     def client_id(self) -> str:
         return self._client_id
 
+    @property
+    def server_info(self) -> ServerInfo | None:
+        """Server info captured during connect(), or None if not connected yet."""
+        return self._server_info
+
     def connect(self) -> None:
-        """Connect to the i3X server."""
-        self._transport.open()
+        """Connect to the i3X server and detect its protocol version.
+
+        The server's ``GET /info`` response (fetched as the connectivity
+        check) is inspected for ``specVersion``:
+
+        - No ``/info`` endpoint: the server is either pre-release (alpha) or
+          ``base_url`` is wrong — raises :class:`~i3x.UnsupportedVersionError`.
+        - ``specVersion`` earlier than 1.0 (or a pre-release such as
+          ``1.0-beta``): emits a :class:`DeprecationWarning`.
+        - ``specVersion`` 1.0 or later: connects silently.
+        """
+        try:
+            info_data = self._transport.open()
+        except errors.NotFoundError:
+            raise errors.UnsupportedVersionError(
+                "Cannot connect: this server does not expose a /info endpoint. "
+                "Check that base_url includes the version prefix required by the "
+                "spec (e.g. https://server.example.com/v1). Pre-release (alpha) "
+                "i3X servers are not supported; upgrade the server to i3X 1.0."
+            )
+
+        self._server_info = (
+            ServerInfo.from_dict(info_data) if isinstance(info_data, dict) else None
+        )
+        spec_version = self._server_info.spec_version if self._server_info else None
+        if not _is_release_version(spec_version):
+            warnings.warn(
+                f"Connected to an i3X server reporting specVersion "
+                f"{spec_version!r}. Pre-release (beta) server support is "
+                "deprecated and will be removed in a future version of "
+                "i3x-client. Please upgrade your server to i3X 1.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         self._sub_manager = SubscriptionManager(
             transport=self._transport,
             client_id=self._client_id,
@@ -92,6 +169,7 @@ class Client:
             self._sub_manager.stop_all()
             self._sub_manager = None
         self._transport.close()
+        self._server_info = None
         if self.on_disconnect:
             self.on_disconnect(self)
 
@@ -166,8 +244,7 @@ class Client:
             json={"elementIds": [element_id], "includeMetadata": include_metadata},
         )
         if not results or not results[0].get("success"):
-            from . import errors
-            raise errors.NotFoundError(f"Object not found: {element_id}", status_code=404)
+            raise _item_error(results[0] if results else None, f"Object not found: {element_id}")
         return ObjectInstance.from_dict(results[0]["result"])
 
     def list_objects(
@@ -203,14 +280,17 @@ class Client:
     # -- Value methods --
 
     def get_value(self, element_id: str, max_depth: int = 1) -> CurrentValue:
-        """Get the last known value for an element."""
+        """Get the last known value for an element.
+
+        ``max_depth`` controls recursion through HasComponent children:
+        1 = no recursion (default), N = recurse N levels, 0 = infinite.
+        """
         results = self._transport.post(
             "/objects/value",
             json={"elementIds": [element_id], "maxDepth": max_depth},
         )
         if not results or not results[0].get("success"):
-            from . import errors
-            raise errors.NotFoundError(f"No value for: {element_id}", status_code=404)
+            raise _item_error(results[0] if results else None, f"No value for: {element_id}")
         return CurrentValue.from_dict(element_id, results[0]["result"])
 
     def get_values(
@@ -218,7 +298,11 @@ class Client:
         element_ids: list[str],
         max_depth: int = 1,
     ) -> dict[str, CurrentValue]:
-        """Get last known values for multiple elements."""
+        """Get last known values for multiple elements.
+
+        ``max_depth`` controls recursion through HasComponent children:
+        1 = no recursion (default), N = recurse N levels, 0 = infinite.
+        """
         results = self._transport.post(
             "/objects/value",
             json={"elementIds": element_ids, "maxDepth": max_depth},
@@ -236,7 +320,11 @@ class Client:
         end_time: str | None = None,
         max_depth: int = 1,
     ) -> HistoricalValue:
-        """Get historical values for an element."""
+        """Get historical values for an element.
+
+        ``max_depth`` controls recursion through HasComponent children:
+        1 = no recursion (default), N = recurse N levels, 0 = infinite.
+        """
         body: dict[str, Any] = {"elementIds": [element_id], "maxDepth": max_depth}
         if start_time is not None:
             body["startTime"] = start_time
@@ -244,21 +332,78 @@ class Client:
             body["endTime"] = end_time
         results = self._transport.post("/objects/history", json=body)
         if not results or not results[0].get("success"):
-            from . import errors
-            raise errors.NotFoundError(f"No history for: {element_id}", status_code=404)
+            raise _item_error(results[0] if results else None, f"No history for: {element_id}")
         return HistoricalValue.from_dict(element_id, results[0]["result"])
 
     # -- Update methods --
 
-    def update_value(self, element_id: str, value: Any) -> None:
-        """Update the current value of an element."""
-        encoded_id = quote(element_id, safe="")
-        self._transport.put(f"/objects/{encoded_id}/value", json=value)
+    @staticmethod
+    def _as_vqt(value: Any, quality: str | None = None, timestamp: str | None = None) -> dict[str, Any]:
+        """Normalize a raw value or VQT-shaped dict into a VQT request payload."""
+        if isinstance(value, dict) and "value" in value:
+            vqt = dict(value)
+        else:
+            vqt = {"value": value}
+        if quality is not None:
+            vqt["quality"] = quality
+        if timestamp is not None:
+            vqt["timestamp"] = timestamp
+        return vqt
 
-    def update_history(self, element_id: str, value: Any) -> None:
-        """Update historical values for an element."""
-        encoded_id = quote(element_id, safe="")
-        self._transport.put(f"/objects/{encoded_id}/history", json=value)
+    @staticmethod
+    def _raise_failed_updates(results: Any) -> None:
+        if not isinstance(results, list):
+            return
+        for item in results:
+            if isinstance(item, dict) and not item.get("success", True):
+                element_id = item.get("elementId", "<unknown>")
+                raise _item_error(item, f"Update failed for: {element_id}")
+
+    def update_value(
+        self,
+        element_id: str,
+        value: Any,
+        quality: str | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        """Update the current value of an element.
+
+        ``value`` may be a raw value (wrapped as ``{"value": ...}``) or a
+        VQT-shaped dict. ``quality`` defaults to "Good" and ``timestamp`` to
+        server time when omitted.
+        """
+        results = self._transport.put("/objects/value", json={
+            "updates": [{"elementId": element_id, "value": self._as_vqt(value, quality, timestamp)}],
+        })
+        self._raise_failed_updates(results)
+
+    def update_values(self, updates: dict[str, Any]) -> list[dict[str, Any]]:
+        """Update current values for multiple elements in one request.
+
+        ``updates`` maps element IDs to raw values or VQT-shaped dicts.
+        Returns the per-element bulk result items; check each item's
+        ``success`` flag for partial failures.
+        """
+        results = self._transport.put("/objects/value", json={
+            "updates": [
+                {"elementId": eid, "value": self._as_vqt(value)}
+                for eid, value in updates.items()
+            ],
+        })
+        return results if isinstance(results, list) else []
+
+    def update_history(self, element_id: str, values: Any) -> None:
+        """Update historical values for an element.
+
+        ``values`` is a VQT dict (``{"value": ..., "quality": ..., "timestamp": ...}``,
+        timestamp required) or a list of them. Servers that do not support
+        history updates raise :class:`~i3x.NotSupportedError`.
+        """
+        items = values if isinstance(values, list) else [values]
+        results = self._transport.put("/objects/history", json={
+            "updates": [{"elementId": element_id, "value": v} for v in items],
+        })
+        self._raise_failed_updates(results)
 
     # -- Subscription methods (high-level) --
 
@@ -274,6 +419,9 @@ class Client:
         1. Create a subscription (POST /subscriptions)
         2. Register monitored items (POST /subscriptions/register)
         3. Start the SSE background stream
+
+        ``max_depth`` controls recursion through HasComponent children:
+        1 = no recursion (default), N = recurse N levels, 0 = infinite.
         """
         result = self._transport.post("/subscriptions", json={
             "clientId": self._client_id,
@@ -321,12 +469,13 @@ class Client:
         self,
         subscription: Subscription | str,
         last_sequence_number: int | None = None,
-    ) -> list[SyncUpdate]:
-        """Poll queued updates for a subscription.
+    ) -> list[SyncBatch]:
+        """Poll queued update batches for a subscription.
 
-        Pass ``last_sequence_number`` (the highest sequenceNumber from the
-        previous call) to acknowledge that batch and receive only newer updates.
-        Omit on the first call.
+        Pass ``last_sequence_number`` (the highest ``sequence_number`` from
+        the previously returned batches) to acknowledge those batches and
+        receive only newer updates. Omit on the first call. Pass ``-1`` to
+        clear the server-side queue.
         """
         sub_id = (
             subscription.subscription_id
@@ -340,7 +489,7 @@ class Client:
         if last_sequence_number is not None:
             body["lastSequenceNumber"] = last_sequence_number
         data = self._transport.post("/subscriptions/sync", json=body)
-        return [SyncUpdate.from_dict(item) for item in (data or [])]
+        return [SyncBatch.from_dict(item) for item in (data or [])]
 
     # -- Subscription methods (low-level) --
 
@@ -386,8 +535,9 @@ class Client:
         })
         if results and results[0].get("success"):
             return Subscription.from_dict(results[0]["result"])
-        from . import errors
-        raise errors.NotFoundError(f"Subscription not found: {subscription_id}", status_code=404)
+        raise _item_error(
+            results[0] if results else None, f"Subscription not found: {subscription_id}"
+        )
 
     def list_subscriptions(self, subscription_ids: list[str]) -> list[Subscription]:
         """Get details for one or more subscriptions by ID."""

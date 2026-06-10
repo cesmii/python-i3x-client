@@ -11,7 +11,7 @@ from i3x.models import (
     RelationshipType,
     ServerInfo,
     Subscription,
-    SyncUpdate,
+    SyncBatch,
     ValueChange,
     VQT,
 )
@@ -106,14 +106,14 @@ class TestObjectInstanceMetadata:
             "sourceTypeId": "SomeType",
             "description": "A test object",
             "relationships": {"HasParent": "root"},
-            "extendedAttributes": {"serial": {"type": "string"}},
+            "schemaExtensions": {"serial": {"type": "string"}},
             "system": {"vendor_id": "abc"},
         })
         assert meta.type_namespace_uri == "http://example.com/ns"
         assert meta.source_type_id == "SomeType"
         assert meta.description == "A test object"
         assert meta.relationships == {"HasParent": "root"}
-        assert meta.extended_attributes == {"serial": {"type": "string"}}
+        assert meta.schema_extensions == {"serial": {"type": "string"}}
         assert meta.system == {"vendor_id": "abc"}
 
     def test_from_dict_all_optional(self):
@@ -252,18 +252,24 @@ class TestValueChange:
         assert vc.timestamp == "2026-01-01T00:00:00Z"
 
 
-class TestSyncUpdate:
+class TestSyncBatch:
     def test_from_dict(self):
-        su = SyncUpdate.from_dict({
+        batch = SyncBatch.from_dict({
             "sequenceNumber": 5,
-            "elementId": "obj-1",
-            "value": 42.0,
-            "quality": "Good",
-            "timestamp": "2026-01-01T00:00:00Z",
+            "updates": [
+                {"elementId": "obj-1", "value": 42.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"},
+                {"elementId": "obj-2", "value": 43.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"},
+            ],
         })
-        assert su.sequence_number == 5
-        assert su.element_id == "obj-1"
-        assert su.value == 42.0
+        assert batch.sequence_number == 5
+        assert len(batch.updates) == 2
+        assert batch.updates[0].element_id == "obj-1"
+        assert batch.updates[0].value == 42.0
+
+    def test_from_dict_no_updates(self):
+        batch = SyncBatch.from_dict({"sequenceNumber": 7})
+        assert batch.sequence_number == 7
+        assert batch.updates == []
 
 
 class TestSubscription:

@@ -17,8 +17,9 @@ class ServerInfo:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ServerInfo:
+        # specVersion is required by the spec, but pre-release servers may omit it.
         return cls(
-            spec_version=data["specVersion"],
+            spec_version=data.get("specVersion", ""),
             server_version=data.get("serverVersion"),
             server_name=data.get("serverName"),
             capabilities=data.get("capabilities", {}),
@@ -94,7 +95,7 @@ class ObjectInstanceMetadata:
     source_type_id: str | None = None
     description: str | None = None
     relationships: dict[str, Any] | None = None
-    extended_attributes: dict[str, Any] | None = None
+    schema_extensions: dict[str, Any] | None = None
     system: dict[str, Any] | None = None
 
     @classmethod
@@ -104,7 +105,7 @@ class ObjectInstanceMetadata:
             source_type_id=data.get("sourceTypeId"),
             description=data.get("description"),
             relationships=data.get("relationships"),
-            extended_attributes=data.get("extendedAttributes"),
+            schema_extensions=data.get("schemaExtensions"),
             system=data.get("system"),
         )
 
@@ -233,23 +234,21 @@ class ValueChange:
 
 
 @dataclass(frozen=True)
-class SyncUpdate:
-    """A queued update returned by POST /subscriptions/sync."""
+class SyncBatch:
+    """A batch of queued updates returned by POST /subscriptions/sync.
+
+    Acknowledge a batch by passing its ``sequence_number`` as
+    ``last_sequence_number`` on the next sync call.
+    """
 
     sequence_number: int
-    element_id: str
-    value: Any
-    quality: str
-    timestamp: str
+    updates: list[ValueChange] = field(default_factory=list)
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> SyncUpdate:
+    def from_dict(cls, data: dict[str, Any]) -> SyncBatch:
         return cls(
             sequence_number=data["sequenceNumber"],
-            element_id=data["elementId"],
-            value=data.get("value"),
-            quality=data.get("quality", ""),
-            timestamp=data.get("timestamp", ""),
+            updates=[ValueChange.from_dict(u) for u in data.get("updates", [])],
         )
 
 

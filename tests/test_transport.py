@@ -10,9 +10,14 @@ from i3x.errors import (
     ConnectionError,
     I3XError,
     NotFoundError,
+    NotSupportedError,
     ServerError,
     TimeoutError,
 )
+
+
+def error_envelope(title, status, detail):
+    return {"success": False, "responseDetail": {"title": title, "status": status, "detail": detail}}
 
 
 @pytest.fixture()
@@ -93,49 +98,50 @@ class TestTransportRequests:
 
 class TestTransportErrorMapping:
     def test_401_raises_auth_error(self, mock_api, transport):
-        mock_api.get("/secret").respond(status_code=401, json={
-            "success": False, "error": {"code": 401, "message": "Unauthorized"}
-        })
+        mock_api.get("/secret").respond(status_code=401, json=error_envelope("Unauthorized", 401, "Missing credentials"))
         with pytest.raises(AuthenticationError):
             transport.get("/secret")
 
     def test_403_raises_auth_error(self, mock_api, transport):
-        mock_api.get("/forbidden").respond(status_code=403, json={
-            "success": False, "error": {"code": 403, "message": "Forbidden"}
-        })
+        mock_api.get("/forbidden").respond(status_code=403, json=error_envelope("Forbidden", 403, "Not authorized"))
         with pytest.raises(AuthenticationError):
             transport.get("/forbidden")
 
     def test_404_raises_not_found(self, mock_api, transport):
-        mock_api.get("/missing").respond(status_code=404, json={
-            "success": False, "error": {"code": 404, "message": "Not Found"}
-        })
+        mock_api.get("/missing").respond(status_code=404, json=error_envelope("Not Found", 404, "No such element"))
         with pytest.raises(NotFoundError):
             transport.get("/missing")
 
     def test_500_raises_server_error(self, mock_api, transport):
-        mock_api.get("/error").respond(status_code=500, json={
-            "success": False, "error": {"code": 500, "message": "Internal Error"}
-        })
+        mock_api.get("/error").respond(status_code=500, json=error_envelope("Internal Error", 500, "Boom"))
         with pytest.raises(ServerError):
             transport.get("/error")
 
+    def test_501_raises_not_supported(self, mock_api, transport):
+        mock_api.put("/objects/history").respond(status_code=501, json=error_envelope(
+            "Not Implemented", 501, "History updates not supported"))
+        with pytest.raises(NotSupportedError, match="History updates not supported"):
+            transport.put("/objects/history", json={"updates": []})
+
     def test_unknown_4xx_raises_base_error(self, mock_api, transport):
-        mock_api.get("/weird").respond(status_code=422, json={
-            "success": False, "error": {"code": 422, "message": "Unprocessable"}
-        })
+        mock_api.get("/weird").respond(status_code=422, json=error_envelope("Unprocessable", 422, "Bad input"))
         with pytest.raises(I3XError):
             transport.get("/weird")
 
     def test_error_preserves_status_code(self, mock_api, transport):
-        mock_api.get("/missing").respond(status_code=404, json={
-            "success": False, "error": {"code": 404, "message": "Not Found"}
-        })
+        mock_api.get("/missing").respond(status_code=404, json=error_envelope("Not Found", 404, "No such element"))
         with pytest.raises(NotFoundError) as exc_info:
             transport.get("/missing")
         assert exc_info.value.status_code == 404
 
-    def test_error_message_extracted_from_envelope(self, mock_api, transport):
+    def test_error_message_extracted_from_response_detail(self, mock_api, transport):
+        mock_api.get("/missing").respond(status_code=404, json=error_envelope(
+            "Not Found", 404, "Element not found: xyz"))
+        with pytest.raises(NotFoundError, match="Element not found: xyz"):
+            transport.get("/missing")
+
+    def test_error_message_extracted_from_legacy_envelope(self, mock_api, transport):
+        # Pre-release servers used {"error": {"code": N, "message": "..."}}
         mock_api.get("/missing").respond(status_code=404, json={
             "success": False, "error": {"code": 404, "message": "Element not found: xyz"}
         })
@@ -144,14 +150,24 @@ class TestTransportErrorMapping:
 
 
 class TestTransportAuth:
-    def test_auth_headers_sent(self, mock_api):
+    def test_basic_auth_tuple_sent(self, mock_api):
         route = mock_api.get("/info").respond(json={"success": True, "result": {
             "specVersion": "1.0",
             "capabilities": {"query": {"history": False}, "update": {"current": False, "history": False}, "subscribe": {"stream": True}},
         }})
-        t = Transport("http://test-server:8080", auth=("my-key", "my-secret"))
+        t = Transport("http://test-server:8080", auth=("user", "secret"))
+        t.open()
+        request = route.calls.last.request
+        assert request.headers["authorization"].startswith("Basic ")
+        t.close()
+
+    def test_custom_headers_sent(self, mock_api):
+        route = mock_api.get("/info").respond(json={"success": True, "result": {
+            "specVersion": "1.0",
+            "capabilities": {"query": {"history": False}, "update": {"current": False, "history": False}, "subscribe": {"stream": True}},
+        }})
+        t = Transport("http://test-server:8080", headers={"X-API-Key": "my-key"})
         t.open()
         request = route.calls.last.request
         assert request.headers["x-api-key"] == "my-key"
-        assert request.headers["x-api-secret"] == "my-secret"
         t.close()

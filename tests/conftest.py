@@ -14,8 +14,12 @@ def bulk(results):
 def bulk_item_ok(element_id, result):
     return {"success": True, "elementId": element_id, "result": result}
 
-def bulk_item_err(element_id, code, message):
-    return {"success": False, "elementId": element_id, "error": {"code": code, "message": message}}
+def bulk_item_err(element_id, code, message, title="Error"):
+    return {
+        "success": False,
+        "elementId": element_id,
+        "responseDetail": {"title": title, "status": code, "detail": message},
+    }
 
 
 SAMPLE_SERVER_INFO = success({
@@ -150,8 +154,19 @@ SAMPLE_REGISTER_BULK = bulk([
 ])
 
 SAMPLE_SYNC_RESPONSE = success([
-    {"sequenceNumber": 1, "elementId": "obj-1", "value": 72.5, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"},
-    {"sequenceNumber": 2, "elementId": "obj-2", "value": 18.3, "quality": "Good", "timestamp": "2026-01-01T00:00:01Z"},
+    {
+        "sequenceNumber": 1,
+        "updates": [
+            {"elementId": "obj-1", "value": 72.5, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"},
+        ],
+    },
+    {
+        "sequenceNumber": 2,
+        "updates": [
+            {"elementId": "obj-1", "value": 73.0, "quality": "Good", "timestamp": "2026-01-01T00:00:01Z"},
+            {"elementId": "obj-2", "value": 18.3, "quality": "Good", "timestamp": "2026-01-01T00:00:01Z"},
+        ],
+    },
 ])
 
 SAMPLE_DELETE_BULK = bulk([
@@ -163,6 +178,6 @@ SAMPLE_DELETE_BULK = bulk([
 def mock_api():
     """Provide a respx mock router pre-configured with common endpoints."""
     with respx.mock(base_url="http://test-server:8080") as router:
-        # Connectivity check for connect() uses GET /info
+        # Connectivity check and version detection during connect() use GET /info
         router.get("/info").respond(json=SAMPLE_SERVER_INFO)
         yield router

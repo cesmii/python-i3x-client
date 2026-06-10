@@ -1,6 +1,10 @@
 # i3x-client
 
-Python client library for i3X servers. Supports the i3X 1.0 Beta specification.
+Python client library for i3X servers. Supports the i3X 1.0 release specification.
+
+Connecting to pre-release servers is deprecated: servers without a `GET /info`
+endpoint (alpha) are rejected with `UnsupportedVersionError`, and servers
+reporting a pre-1.0 `specVersion` (beta) emit a `DeprecationWarning`.
 
 ## Installation
 
@@ -41,8 +45,12 @@ history = client.get_history("sensor-001", start_time="2026-01-01T00:00:00Z")
 for vqt in history.values:
     print(vqt.value, vqt.timestamp)
 
-# Write a value
+# Write a value (quality defaults to "Good", timestamp to server time)
+client.update_value("sensor-001", 72.5)
 client.update_value("sensor-001", {"value": 72.5, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"})
+
+# Write several values in one request
+client.update_values({"sensor-001": 72.5, "sensor-002": 18.3})
 
 client.disconnect()
 ```
@@ -78,19 +86,30 @@ sub_id = client.create_subscription()
 client.register_items(sub_id, ["sensor-001"])
 
 # First poll — no lastSequenceNumber
-updates = client.sync_subscription(sub_id)
-last_seq = updates[-1].sequence_number if updates else None
+batches = client.sync_subscription(sub_id)
+last_seq = batches[-1].sequence_number if batches else None
 
-# Subsequent polls — ack previous batch, receive new ones
-updates = client.sync_subscription(sub_id, last_sequence_number=last_seq)
-for u in updates:
-    print(u.sequence_number, u.element_id, u.value)
+# Subsequent polls — ack previous batches, receive new ones
+batches = client.sync_subscription(sub_id, last_sequence_number=last_seq)
+for batch in batches:
+    for u in batch.updates:
+        print(batch.sequence_number, u.element_id, u.value)
 ```
 
 ### Authentication
 
+The i3X spec requires authentication, but does not mandate an authentication scheme, so pass whatever your
+server requires:
+
 ```python
-client = i3x.Client("https://my-i3x-server/v1", auth=("api-key", "secret"))
+# Bearer token (Authorization: Bearer <token>)
+client = i3x.Client("https://my-i3x-server/v1", token="my-token")
+
+# HTTP Basic (or any httpx auth object)
+client = i3x.Client("https://my-i3x-server/v1", auth=("user", "password"))
+
+# Custom header scheme
+client = i3x.Client("https://my-i3x-server/v1", headers={"X-API-Key": "my-key"})
 ```
 
 ### Custom Client ID
@@ -106,14 +125,18 @@ client = i3x.Client("https://my-i3x-server/v1", client_id="my-app-instance-1")
 ### Client
 
 ```python
-i3x.Client(base_url, auth=None, timeout=30.0, client_id=None)
+i3x.Client(base_url, auth=None, timeout=30.0, client_id=None, token=None, headers=None)
 ```
 
+`base_url` must include the version prefix required by the spec, e.g.
+`https://server.example.com/v1`.
+
 #### Connection
-- `connect()` — Connect to the server (verifies via `GET /info`)
+- `connect()` — Connect to the server (verifies via `GET /info` and checks `specVersion`)
 - `disconnect()` — Disconnect and stop all subscriptions
 - `is_connected` — Connection state
 - `client_id` — The client ID used to scope subscriptions
+- `server_info` — `ServerInfo` captured during `connect()`
 
 #### Server Info
 - `get_info()` → `ServerInfo` — Server version and capabilities
@@ -134,14 +157,18 @@ i3x.Client(base_url, auth=None, timeout=30.0, client_id=None)
 - `get_values(element_ids, max_depth=1)` → `dict[str, CurrentValue]`
 - `get_history(element_id, start_time=None, end_time=None, max_depth=1)` → `HistoricalValue`
 
+`max_depth` controls recursion through HasComponent children: `1` = no
+recursion (default), `N` = recurse N levels, `0` = infinite.
+
 #### Updates
-- `update_value(element_id, value)` — Write a value in VQT format
-- `update_history(element_id, value)` — Write historical values
+- `update_value(element_id, value, quality=None, timestamp=None)` — Write a value (raw or VQT dict)
+- `update_values(updates)` — Write values for multiple elements (`{element_id: value}`)
+- `update_history(element_id, values)` — Write historical VQTs (timestamp required); raises `NotSupportedError` if the server doesn't support it
 
 #### Subscriptions (High-Level)
 - `subscribe(element_ids, max_depth=1, display_name=None)` → `Subscription` — Create + register + stream
 - `unsubscribe(subscription)` — Stop stream and delete subscription
-- `sync_subscription(subscription, last_sequence_number=None)` → `list[SyncUpdate]`
+- `sync_subscription(subscription, last_sequence_number=None)` → `list[SyncBatch]` — pass `-1` to clear the queue
 
 #### Subscriptions (Low-Level)
 - `create_subscription(display_name=None)` → `str` — Returns subscription ID
@@ -170,13 +197,13 @@ All models are frozen dataclasses.
 | `ObjectType` | `element_id`, `display_name`, `namespace_uri`, `source_type_id`, `version`, `schema`, `related` |
 | `RelationshipType` | `element_id`, `display_name`, `namespace_uri`, `relationship_id`, `reverse_of` |
 | `ObjectInstance` | `element_id`, `display_name`, `type_element_id`, `parent_id`, `is_composition`, `is_extended`, `metadata` |
-| `ObjectInstanceMetadata` | `type_namespace_uri`, `source_type_id`, `description`, `relationships`, `extended_attributes`, `system` |
+| `ObjectInstanceMetadata` | `type_namespace_uri`, `source_type_id`, `description`, `relationships`, `schema_extensions`, `system` |
 | `RelatedObject` | `source_relationship`, `object` |
 | `VQT` | `value`, `quality`, `timestamp` |
 | `CurrentValue` | `element_id`, `is_composition`, `value`, `quality`, `timestamp`, `components` |
 | `HistoricalValue` | `element_id`, `is_composition`, `values` (list of VQT) |
 | `ValueChange` | `element_id`, `value`, `quality`, `timestamp` |
-| `SyncUpdate` | `sequence_number`, `element_id`, `value`, `quality`, `timestamp` |
+| `SyncBatch` | `sequence_number`, `updates` (list of ValueChange) |
 | `Subscription` | `subscription_id`, `client_id`, `display_name`, `monitored_objects` |
 
 ### Errors
@@ -186,10 +213,12 @@ All errors inherit from `i3x.I3XError`:
 - `ConnectionError` — Failed to connect
 - `AuthenticationError` — Auth rejected (401/403)
 - `NotFoundError` — Resource not found (404)
+- `NotSupportedError` — Optional feature not supported by the server (501)
 - `ServerError` — Server error (5xx)
 - `TimeoutError` — Request timed out
 - `SubscriptionError` — Subscription operation failed
 - `StreamError` — SSE streaming error
+- `UnsupportedVersionError` — Server runs an unsupported (pre-release) i3X version
 
 ## License
 
