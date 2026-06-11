@@ -1,12 +1,13 @@
 """i3x - Python client library for i3X servers."""
 
-__version__ = "0.6.0"
+__version__ = "1.0.0"
 
 from .client import Client
 from .errors import (
     AuthenticationError,
     ConnectionError,
     I3XError,
+    InvalidServerResponseError,
     NotFoundError,
     NotSupportedError,
     ServerError,
@@ -45,6 +46,7 @@ __all__ = [
     "SubscriptionError",
     "StreamError",
     "UnsupportedVersionError",
+    "InvalidServerResponseError",
     # Models
     "ServerInfo",
     "Namespace",

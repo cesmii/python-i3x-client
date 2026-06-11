@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 import uuid
 import warnings
 from typing import Any, Callable
+from urllib.parse import quote
 
 from . import errors
 
@@ -27,16 +30,64 @@ from .models import (
 
 logger = logging.getLogger("i3x")
 
+_ALPHA_ERROR_MESSAGE = (
+    "Cannot connect: GET /info returned 404. The server may be a pre-release "
+    "(alpha) i3X server that predates the /info endpoint (these are no longer "
+    "supported — upgrade to i3X 1.0), or base_url may be wrong. Check that "
+    "base_url includes the version prefix required by the spec, e.g. "
+    "https://server.example.com/v1."
+)
 
-def _is_release_version(spec_version: str | None) -> bool:
-    """True if specVersion reports i3X 1.0 or later (not an alpha/beta pre-release)."""
+
+def _ansi(text: str, code: str) -> str:
+    """Wrap ``text`` in an ANSI escape when stderr is an interactive terminal."""
+    try:
+        if not os.environ.get("NO_COLOR") and sys.stderr.isatty():
+            return f"\033[{code}m{text}\033[0m"
+    except Exception:
+        pass
+    return text
+
+
+def _orange(text: str) -> str:
+    """256-color orange (208). Used for beta deprecation warning."""
+    return _ansi(text, "38;5;208")
+
+
+def _red(text: str) -> str:
+    """256-color bright red (196). Used for alpha/unsupported-version errors."""
+    return _ansi(text, "38;5;196")
+
+
+def _invalid_response_message(status_code: int, content_type: str) -> str:
+    """Build the error for a /info response that is not a valid i3X document."""
+    ctype = content_type.split(";")[0].strip() if content_type else "unknown"
+    return (
+        f"GET /info responded (HTTP {status_code}, content-type {ctype!r}) but "
+        "the body is not a valid i3X document (a JSON object with a specVersion). "
+        "base_url is most likely pointing at something that is not an i3X API "
+        "root — a web page or login/SSO portal, an API gateway, or another "
+        "service. Verify base_url ends with the API version prefix, e.g. "
+        "https://server.example.com/v1."
+    )
+
+
+def _is_release_version(
+    spec_version: str | None, server_version: str | None = None
+) -> bool:
+    """True if the server reports a released i3X (1.0+), not an alpha/beta pre-release.
+
+    Beta servers report the same ``specVersion`` ("1.0") as release servers, so
+    ``specVersion`` alone cannot tell them apart. The distinguishing marker is
+    ``serverVersion`` (e.g. "beta"). Both fields are checked for a pre-release tag.
+    """
+    for marker in (server_version, spec_version):
+        if marker and ("alpha" in str(marker).lower() or "beta" in str(marker).lower()):
+            return False
     if not spec_version:
         return False
-    version = str(spec_version).strip().lower()
-    if "alpha" in version or "beta" in version:
-        return False
     try:
-        major = int(version.split(".")[0])
+        major = int(str(spec_version).strip().split(".")[0])
     except ValueError:
         return False
     return major >= 1
@@ -77,6 +128,11 @@ class Client:
 
     A ``client_id`` is used to scope subscriptions to this client instance.
     If not provided, a UUID is generated automatically.
+
+    TLS: ``verify`` is passed through to httpx. Leave it ``True`` in production.
+    For a development/test server using a self-signed certificate, pass
+    ``verify=False`` to skip verification, or ``verify="/path/to/ca.pem"`` to
+    trust a custom CA bundle.
     """
 
     def __init__(
@@ -87,14 +143,18 @@ class Client:
         client_id: str | None = None,
         token: str | None = None,
         headers: dict[str, str] | None = None,
+        verify: Any = True,
     ):
         all_headers = dict(headers or {})
         if token:
             all_headers["Authorization"] = f"Bearer {token}"
-        self._transport = Transport(base_url, auth=auth, timeout=timeout, headers=all_headers)
+        self._transport = Transport(
+            base_url, auth=auth, timeout=timeout, headers=all_headers, verify=verify
+        )
         self._client_id = client_id or str(uuid.uuid4())
         self._sub_manager: SubscriptionManager | None = None
         self._server_info: ServerInfo | None = None
+        self._is_beta_server: bool = False
 
         # Callbacks
         self.on_connect: Callable[[Client], None] | None = None
@@ -121,35 +181,49 @@ class Client:
     def connect(self) -> None:
         """Connect to the i3X server and detect its protocol version.
 
-        The server's ``GET /info`` response (fetched as the connectivity
-        check) is inspected for ``specVersion``:
+        The server's ``GET /info`` response (the connectivity check) is
+        validated and classified. Each failure mode is distinct:
 
-        - No ``/info`` endpoint: the server is either pre-release (alpha) or
-          ``base_url`` is wrong — raises :class:`~i3x.UnsupportedVersionError`.
-        - ``specVersion`` earlier than 1.0 (or a pre-release such as
-          ``1.0-beta``): emits a :class:`DeprecationWarning`.
-        - ``specVersion`` 1.0 or later: connects silently.
+        - ``GET /info`` returns 404: pre-release (alpha) server or wrong
+          ``base_url`` — raises :class:`~i3x.UnsupportedVersionError`.
+        - ``GET /info`` responds but the body is not a valid i3X document (a
+          JSON object with ``specVersion``) — e.g. an HTML login page, a gateway,
+          or a non-i3X service — raises :class:`~i3x.InvalidServerResponseError`.
+        - A pre-release (beta) server — identified by ``serverVersion`` (beta
+          servers report ``specVersion`` "1.0" just like release servers):
+          emits a :class:`DeprecationWarning` and routes value updates to the
+          beta endpoints so the client still works.
+        - A released i3X 1.0+ server: connects silently.
+
+        Connection, TLS, timeout, and auth (401/403) failures surface as their
+        own errors (:class:`~i3x.ConnectionError`, :class:`~i3x.TimeoutError`,
+        :class:`~i3x.AuthenticationError`) rather than being reported as alpha.
         """
         try:
-            info_data = self._transport.open()
+            info = self._transport.open()
         except errors.NotFoundError:
-            raise errors.UnsupportedVersionError(
-                "Cannot connect: this server does not expose a /info endpoint. "
-                "Check that base_url includes the version prefix required by the "
-                "spec (e.g. https://server.example.com/v1). Pre-release (alpha) "
-                "i3X servers are not supported; upgrade the server to i3X 1.0."
+            # open() closes the transport itself when /info 404s.
+            raise errors.UnsupportedVersionError(_red(_ALPHA_ERROR_MESSAGE))
+
+        # Positively identify a valid i3X server: a JSON object with specVersion.
+        if not isinstance(info.data, dict) or "specVersion" not in info.data:
+            self._transport.close()
+            raise errors.InvalidServerResponseError(
+                _invalid_response_message(info.status_code, info.content_type)
             )
 
-        self._server_info = (
-            ServerInfo.from_dict(info_data) if isinstance(info_data, dict) else None
-        )
-        spec_version = self._server_info.spec_version if self._server_info else None
-        if not _is_release_version(spec_version):
+        self._server_info = ServerInfo.from_dict(info.data)
+        spec_version = self._server_info.spec_version
+        server_version = self._server_info.server_version
+        self._is_beta_server = not _is_release_version(spec_version, server_version)
+        if self._is_beta_server:
             warnings.warn(
-                f"Connected to an i3X server reporting specVersion "
-                f"{spec_version!r}. Pre-release (beta) server support is "
-                "deprecated and will be removed in a future version of "
-                "i3x-client. Please upgrade your server to i3X 1.0.",
+                _orange(
+                    f"Connected to a pre-release (beta) i3X server "
+                    f"(serverVersion={server_version!r}, specVersion={spec_version!r}). "
+                    "Beta server support is deprecated and will be removed in a future "
+                    "version of i3x-client. Please upgrade your server to i3X 1.0."
+                ),
                 DeprecationWarning,
                 stacklevel=2,
             )
@@ -350,6 +424,15 @@ class Client:
             vqt["timestamp"] = timestamp
         return vqt
 
+    def _update_value_beta(self, element_id: str, vqt: dict[str, Any]) -> None:
+        """Update a single value on a beta server.
+
+        Beta servers expose per-element ``PUT /objects/{elementId}/value`` taking
+        a bare VQT body, instead of the release bulk ``PUT /objects/value``.
+        """
+        quoted = quote(element_id, safe="")
+        self._transport.put(f"/objects/{quoted}/value", json=vqt)
+
     @staticmethod
     def _raise_failed_updates(results: Any) -> None:
         if not isinstance(results, list):
@@ -372,8 +455,12 @@ class Client:
         VQT-shaped dict. ``quality`` defaults to "Good" and ``timestamp`` to
         server time when omitted.
         """
+        vqt = self._as_vqt(value, quality, timestamp)
+        if self._is_beta_server:
+            self._update_value_beta(element_id, vqt)
+            return
         results = self._transport.put("/objects/value", json={
-            "updates": [{"elementId": element_id, "value": self._as_vqt(value, quality, timestamp)}],
+            "updates": [{"elementId": element_id, "value": vqt}],
         })
         self._raise_failed_updates(results)
 
@@ -383,7 +470,17 @@ class Client:
         ``updates`` maps element IDs to raw values or VQT-shaped dicts.
         Returns the per-element bulk result items; check each item's
         ``success`` flag for partial failures.
+
+        Beta servers have no bulk update endpoint, so each element is sent
+        individually via ``PUT /objects/{elementId}/value``; a synthetic
+        success item is returned per element (a failed element raises instead).
         """
+        if self._is_beta_server:
+            items: list[dict[str, Any]] = []
+            for eid, value in updates.items():
+                self._update_value_beta(eid, self._as_vqt(value))
+                items.append({"elementId": eid, "success": True})
+            return items
         results = self._transport.put("/objects/value", json={
             "updates": [
                 {"elementId": eid, "value": self._as_vqt(value)}

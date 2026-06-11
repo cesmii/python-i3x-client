@@ -17,7 +17,8 @@ class ServerInfo:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ServerInfo:
-        # specVersion is required by the spec, but pre-release servers may omit it.
+        # connect() guarantees specVersion is present before building this;
+        # default defensively in case from_dict is called directly elsewhere.
         return cls(
             spec_version=data.get("specVersion", ""),
             server_version=data.get("serverVersion"),

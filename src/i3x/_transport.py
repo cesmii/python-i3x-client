@@ -3,13 +3,42 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import ssl
+from typing import Any, NamedTuple
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
 from . import errors
 
 logger = logging.getLogger("i3x.transport")
+
+
+class InfoResult(NamedTuple):
+    """The outcome of fetching ``/info`` during connect.
+
+    ``data`` is the unwrapped JSON payload (a dict for a valid i3X server), or
+    ``None`` when the response was not parseable JSON. ``status_code`` and
+    ``content_type`` are retained so the caller can build a precise error.
+    ``final_url`` is the URL of the response after any redirects.
+    """
+
+    status_code: int
+    content_type: str
+    data: Any
+    final_url: str = ""
+
+
+def _is_ssl_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or anything it wraps) is a TLS/certificate error."""
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ssl.SSLError):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
 
 
 class Transport:
@@ -21,11 +50,13 @@ class Transport:
         auth: Any = None,
         timeout: float = 30.0,
         headers: dict[str, str] | None = None,
+        verify: Any = True,
     ):
         self._base_url = base_url.rstrip("/")
         self._auth = auth
         self._timeout = timeout
         self._headers = dict(headers or {})
+        self._verify = verify
         self._client: httpx.Client | None = None
 
     @property
@@ -36,25 +67,89 @@ class Transport:
     def is_open(self) -> bool:
         return self._client is not None
 
-    def open(self) -> Any:
+    def open(self) -> InfoResult:
         """Open the underlying HTTP client and verify connectivity via GET /info.
 
-        Returns the parsed /info payload so callers can inspect the server's
-        specVersion without an extra round trip.
+        Returns an :class:`InfoResult` carrying the response status, content type,
+        and parsed payload so the caller can distinguish a valid i3X server from
+        an unrelated endpoint. Transport-level failures (connection, TLS, timeout)
+        and HTTP error statuses (401/403/404/5xx) raise as usual.
         """
-        if self._client is not None:
-            return self.get("/info")
+        try:
+            if self._client is None:
+                # Constructing the client validates base_url (may raise InvalidURL).
+                self._client = httpx.Client(
+                    base_url=self._base_url,
+                    auth=self._auth,
+                    headers=self._headers,
+                    timeout=self._timeout,
+                    verify=self._verify,
+                    follow_redirects=True,
+                )
+            result = self._fetch_info()
+            self._maybe_upgrade_scheme(result.final_url)
+            return result
+        except Exception as exc:
+            self.close()
+            raise self._request_error(exc) from exc
+
+    def _fetch_info(self) -> InfoResult:
+        """GET /info and return its status, content type, and parsed payload.
+
+        Maps connection/TLS/timeout failures and HTTP error statuses to i3X
+        errors. A 2xx response with an empty, non-JSON, or unparseable body
+        yields ``data=None`` rather than raising, leaving the caller to decide.
+        """
+        client = self._ensure_open()
+        try:
+            response = client.request("GET", "/info")
+        except Exception as exc:
+            raise self._request_error(exc) from exc
+
+        self._check_status(response)
+        content_type = response.headers.get("content-type", "")
+
+        data: Any = None
+        if response.content and "application/json" in content_type:
+            try:
+                data = self._unwrap_envelope(response.json())
+            except ValueError:
+                data = None
+        return InfoResult(response.status_code, content_type, data, str(response.url))
+
+    def _maybe_upgrade_scheme(self, final_info_url: str) -> None:
+        """Rebuild the httpx client if ``/info`` redirected to a different scheme.
+
+        When a plain-HTTP base URL redirects to HTTPS, httpx safely follows the
+        redirect for GET /info (because GETs are idempotent). But subsequent POST
+        and PUT requests would be redirected too, and HTTP 301/302 redirect
+        semantics convert POST to GET — causing 405 Method Not Allowed on the
+        HTTPS endpoint. Detecting the scheme change here and rebuilding the client
+        with the HTTPS base URL avoids the problem entirely.
+        """
+        if not final_info_url or self._client is None:
+            return
+        orig = urlparse(self._base_url)
+        final = urlparse(final_info_url)
+        if orig.scheme == final.scheme:
+            return
+        # Strip the trailing /info that httpx appended to form the request URL.
+        path = final.path
+        if not path.endswith("/info"):
+            return  # unexpected URL shape — don't guess
+        new_base = urlunparse((final.scheme, final.netloc, path[:-5], "", "", ""))
+        logger.debug("Scheme redirect %s → %s: rebuilding client", self._base_url, new_base)
+        self._base_url = new_base
+        old = self._client
         self._client = httpx.Client(
-            base_url=self._base_url,
+            base_url=new_base,
             auth=self._auth,
             headers=self._headers,
             timeout=self._timeout,
+            verify=self._verify,
+            follow_redirects=True,
         )
-        try:
-            return self.get("/info")
-        except Exception:
-            self.close()
-            raise
+        old.close()
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
@@ -66,6 +161,37 @@ class Transport:
         if self._client is None:
             raise errors.ConnectionError("Transport is not connected. Call open() first.")
         return self._client
+
+    @staticmethod
+    def _connect_error(exc: BaseException) -> errors.ConnectionError:
+        """Map a connect/transport failure to a ConnectionError, with TLS guidance."""
+        if _is_ssl_error(exc):
+            return errors.ConnectionError(
+                f"TLS certificate verification failed: {exc}. If you are connecting "
+                "to a development or test server with a self-signed certificate, pass "
+                "verify=False (to skip verification) or verify='/path/to/ca.pem' (to "
+                "trust a custom CA) when constructing the client, e.g. "
+                "i3x.Client(url, verify=False)."
+            )
+        return errors.ConnectionError(str(exc))
+
+    def _request_error(self, exc: BaseException) -> errors.I3XError:
+        """Map any exception raised while issuing a request to an I3XError.
+
+        Guarantees a request failure never escapes as a raw traceback: known
+        httpx errors map to their specific i3X type; anything else (e.g.
+        ``httpx.InvalidURL``, ``OSError``, or an unexpected error) falls back to
+        a ConnectionError rather than propagating unwrapped.
+        """
+        if isinstance(exc, errors.I3XError):
+            return exc  # already mapped (e.g. by _check_status); don't re-wrap
+        if isinstance(exc, httpx.ConnectError):
+            return self._connect_error(exc)
+        if isinstance(exc, httpx.TimeoutException):
+            return errors.TimeoutError(str(exc))
+        if isinstance(exc, httpx.HTTPError):
+            return errors.I3XError(str(exc))
+        return self._connect_error(exc)
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         client = self._ensure_open()
@@ -105,10 +231,8 @@ class Transport:
                 finally:
                     response.close()
             return response
-        except httpx.ConnectError as exc:
-            raise errors.ConnectionError(str(exc)) from exc
-        except httpx.TimeoutException as exc:
-            raise errors.TimeoutError(str(exc)) from exc
+        except Exception as exc:
+            raise self._request_error(exc) from exc
 
     def _request(
         self,
@@ -120,12 +244,8 @@ class Transport:
     ) -> Any:
         try:
             response = client.request(method, path, params=params, json=json)
-        except httpx.ConnectError as exc:
-            raise errors.ConnectionError(str(exc)) from exc
-        except httpx.TimeoutException as exc:
-            raise errors.TimeoutError(str(exc)) from exc
-        except httpx.HTTPError as exc:
-            raise errors.I3XError(str(exc)) from exc
+        except Exception as exc:
+            raise self._request_error(exc) from exc
 
         self._check_status(response)
 
@@ -141,17 +261,27 @@ class Transport:
         if "application/json" not in content_type:
             return response.text
 
-        body = response.json()
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise errors.I3XError(
+                f"Server returned malformed JSON for {method} {path}: {exc}"
+            ) from exc
+        return self._unwrap_envelope(body)
 
-        # Unwrap the standard i3X response envelope.
-        # Simple success: {"success": true, "result": <data>}  → return result
-        # Bulk response:  {"success": bool, "results": [...]}  → return results list
+    @staticmethod
+    def _unwrap_envelope(body: Any) -> Any:
+        """Unwrap the standard i3X response envelope.
+
+        Simple success: ``{"success": true, "result": <data>}``  → ``<data>``.
+        Bulk response:  ``{"success": bool, "results": [...]}``   → the list.
+        Anything else is returned unchanged.
+        """
         if isinstance(body, dict):
             if "result" in body:
                 return body["result"]
             if "results" in body:
                 return body["results"]
-
         return body
 
     @staticmethod

@@ -1,10 +1,12 @@
 """Tests for i3x._transport."""
 
+import ssl
+
 import httpx
 import pytest
 import respx
 
-from i3x._transport import Transport
+from i3x._transport import Transport, _is_ssl_error
 from i3x.errors import (
     AuthenticationError,
     ConnectionError,
@@ -147,6 +149,100 @@ class TestTransportErrorMapping:
         })
         with pytest.raises(NotFoundError, match="Element not found: xyz"):
             transport.get("/missing")
+
+
+class TestTransportRedirects:
+    def test_follows_redirect(self):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(
+                status_code=301, headers={"location": "http://test-server:8080/v1/info"})
+            router.get("/v1/info").respond(json={"success": True, "result": {
+                "specVersion": "1.0", "capabilities": {}}})
+            t = Transport("http://test-server:8080")
+            result = t.open()
+            assert result.data["specVersion"] == "1.0"
+            t.close()
+
+    def test_http_to_https_redirect_rebuilds_client(self):
+        # When http:// redirects to https://, the client must be rebuilt so that
+        # subsequent POSTs go directly to HTTPS (not re-redirected, which would
+        # cause httpx to convert POST → GET, resulting in 405).
+        with respx.mock() as router:
+            router.get("http://test-server:8080/v1/info").respond(
+                status_code=301, headers={"location": "https://test-server:8443/v1/info"})
+            router.get("https://test-server:8443/v1/info").respond(json={"success": True, "result": {
+                "specVersion": "1.0", "capabilities": {}}})
+            t = Transport("http://test-server:8080/v1")
+            t.open()
+            assert t.base_url == "https://test-server:8443/v1"
+            t.close()
+
+
+class TestTransportTLS:
+    def test_is_ssl_error_detects_wrapped_cause(self):
+        outer = httpx.ConnectError("certificate verify failed")
+        outer.__cause__ = ssl.SSLCertVerificationError("self-signed certificate")
+        assert _is_ssl_error(outer) is True
+
+    def test_is_ssl_error_false_for_plain_connect_error(self):
+        assert _is_ssl_error(httpx.ConnectError("connection refused")) is False
+
+    def test_ssl_error_maps_to_connection_error_with_guidance(self):
+        exc = httpx.ConnectError("certificate verify failed")
+        exc.__cause__ = ssl.SSLCertVerificationError("self-signed certificate")
+        mapped = Transport._connect_error(exc)
+        assert isinstance(mapped, ConnectionError)
+        assert "verify=False" in str(mapped)
+
+    def test_plain_connect_error_has_no_tls_guidance(self):
+        mapped = Transport._connect_error(httpx.ConnectError("connection refused"))
+        assert isinstance(mapped, ConnectionError)
+        assert "verify=False" not in str(mapped)
+        assert "connection refused" in str(mapped)
+
+    def test_verify_passed_through(self):
+        t = Transport("https://test-server", verify=False)
+        assert t._verify is False
+
+
+class TestTransportErrorSafetyNet:
+    """No request failure may escape open()/requests as a raw (non-i3X) traceback."""
+
+    def test_invalid_url_maps_to_i3x_error(self):
+        # httpx.InvalidURL is NOT a subclass of httpx.HTTPError.
+        t = Transport("http://\x01/v1")
+        with pytest.raises(I3XError):
+            t.open()
+        assert not t.is_open
+
+    def test_request_error_passes_through_existing_i3x_error(self):
+        t = Transport("http://test-server:8080")
+        original = NotFoundError("not found", status_code=404)
+        assert t._request_error(original) is original
+
+    def test_request_error_wraps_unexpected_exception(self):
+        t = Transport("http://test-server:8080")
+        mapped = t._request_error(OSError("disk on fire"))
+        assert isinstance(mapped, I3XError)
+        assert "disk on fire" in str(mapped)
+
+    def test_request_error_maps_invalid_url(self):
+        t = Transport("http://test-server:8080")
+        mapped = t._request_error(httpx.InvalidURL("bad url"))
+        assert isinstance(mapped, ConnectionError)
+
+    def test_malformed_json_body_maps_to_i3x_error(self):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(json={"success": True, "result": {
+                "specVersion": "1.0", "capabilities": {}}})
+            router.get("/data").respond(
+                status_code=200, text="not json",
+                headers={"content-type": "application/json"})
+            t = Transport("http://test-server:8080")
+            t.open()
+            with pytest.raises(I3XError, match="malformed JSON"):
+                t.get("/data")
+            t.close()
 
 
 class TestTransportAuth:

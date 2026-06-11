@@ -44,7 +44,21 @@ class StreamError(I3XError):
 
 
 class UnsupportedVersionError(I3XError):
-    """The server is running an unsupported version of the i3X specification."""
+    """The server is running an unsupported version of the i3X specification.
+
+    Raised when ``/info`` is absent (HTTP 404) — the hallmark of a pre-release
+    (alpha) server that predates the endpoint, though it can also mean the
+    base URL points at the wrong path.
+    """
+
+
+class InvalidServerResponseError(I3XError):
+    """The endpoint responded, but not with a valid i3X ``/info`` document.
+
+    Typically means ``base_url`` points at something that is not an i3X API
+    root — a web page or login/SSO portal, an API gateway, or another service —
+    rather than that the server is unsupported.
+    """
 
 
 _STATUS_MAP: dict[int, type[I3XError]] = {

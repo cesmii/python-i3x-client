@@ -1,6 +1,6 @@
 # i3x-client
 
-Python client library for i3X servers. Supports the i3X 1.0 release specification.
+Python client library for i3X servers, provided by CESMII. Supports the i3X 1.0 release specification.
 
 Connecting to pre-release servers is deprecated: servers without a `GET /info`
 endpoint (alpha) are rejected with `UnsupportedVersionError`, and servers
@@ -24,7 +24,7 @@ pip install -e ".[dev]"
 import i3x
 
 # Connect to an i3X server
-client = i3x.Client("https://my-i3x-server/v1")
+client = i3x.Client("https://api.i3x.dev/v1")   # Replace with your server
 client.connect()
 
 # Check server capabilities
@@ -58,14 +58,14 @@ client.disconnect()
 ### Context Manager
 
 ```python
-with i3x.Client("https://my-i3x-server/v1") as client:
+with i3x.Client("https://api.i3x.dev/v1") as client:
     namespaces = client.get_namespaces()
 ```
 
 ### Subscriptions (SSE Streaming)
 
 ```python
-client = i3x.Client("https://my-i3x-server/v1")
+client = i3x.Client("https://api.i3x.dev/v1")
 client.on_value_change = lambda client, change: print(f"{change.element_id}: {change.value} ({change.quality})")
 client.connect()
 
@@ -96,6 +96,94 @@ for batch in batches:
         print(batch.sequence_number, u.element_id, u.value)
 ```
 
+### Hierarchy Traversal
+
+`get_objects()` loads the full address space in a single call. Every object carries a `parent_id` that encodes the complete tree — both the organizational hierarchy (`HasChildren`) and the internal composition of each node (`HasComponent`). Group by `parent_id` to reconstruct the tree in memory without additional round-trips:
+
+```python
+client = i3x.Client("https://api.i3x.dev/v1")
+client.connect()
+
+objects = client.get_objects()
+
+children_of = {}
+for obj in objects:
+    children_of.setdefault(obj.parent_id, []).append(obj)
+
+def print_subtree(parent_id=None, depth=0):
+    for obj in children_of.get(parent_id, []):
+        print("  " * depth + f"{obj.display_name}  [{obj.type_element_id}]")
+        print_subtree(obj.element_id, depth + 1)
+
+print_subtree()   # parent_id=None → roots
+client.disconnect()
+```
+
+To start from a known root and walk only one branch using relationship queries:
+
+```python
+def walk_components(element_id, depth=0):
+    obj = client.get_object(element_id)
+    print("  " * depth + obj.display_name)
+    for rel in client.get_related_objects([element_id], relationship_type="HasComponent"):
+        walk_components(rel.object.element_id, depth + 1)
+
+walk_components("pump-101")
+```
+
+### Graph Traversal
+
+Cross-branch relationships like `SuppliesTo` and `Monitors` connect objects that are unrelated in the hierarchy, making the address space a directed graph. Follow edges with `get_related_objects` and a specific relationship type:
+
+```python
+client = i3x.Client("https://api.i3x.dev/v1")
+client.connect()
+
+# Process flow: what does pump-101 feed into?
+for rel in client.get_related_objects(["pump-101"], relationship_type="SuppliesTo"):
+    print(f"pump-101 → {rel.object.display_name}")
+# pump-101 → tank-201
+
+# Instrumentation: which sensors cover tank-201?
+for rel in client.get_related_objects(["tank-201"], relationship_type="MonitoredBy"):
+    print(f"{rel.object.display_name} monitors tank-201")
+# TempSensor-101 monitors tank-201
+
+client.disconnect()
+```
+
+For multi-hop traversal, BFS over arbitrary relationship types:
+
+```python
+from collections import deque
+
+def bfs(start_id, rel_types):
+    """Yield every object reachable from start_id via rel_types (breadth-first)."""
+    seen, queue = set(), deque([start_id])
+    while queue:
+        eid = queue.popleft()
+        if eid in seen:
+            continue
+        seen.add(eid)
+        yield client.get_object(eid)
+        for rel_type in rel_types:
+            for rel in client.get_related_objects([eid], relationship_type=rel_type):
+                queue.append(rel.object.element_id)
+
+# Trace everything downstream of pump-101 through the process chain
+for obj in bfs("pump-101", ["SuppliesTo"]):
+    print(obj.display_name)
+# pump-101
+# tank-201
+
+# Walk instrumentation outward from pump-101: what does it supply, and what monitors those targets?
+for obj in bfs("pump-101", ["SuppliesTo", "MonitoredBy"]):
+    print(obj.display_name)
+# pump-101
+# tank-201
+# TempSensor-101
+```
+
 ### Authentication
 
 The i3X spec requires authentication, but does not mandate an authentication scheme, so pass whatever your
@@ -112,6 +200,25 @@ client = i3x.Client("https://my-i3x-server/v1", auth=("user", "password"))
 client = i3x.Client("https://my-i3x-server/v1", headers={"X-API-Key": "my-key"})
 ```
 
+### TLS / Self-Signed Certificates
+
+By default the client verifies the server's TLS certificate. Development and
+test servers often use a self-signed certificate; pass `verify` to handle that:
+
+```python
+# Skip certificate verification entirely (dev/test only)
+client = i3x.Client("https://localhost:8443/v1", verify=False)
+
+# Or trust a custom CA bundle instead of disabling verification
+client = i3x.Client("https://my-dev-server/v1", verify="/path/to/ca.pem")
+```
+
+Leave `verify=True` (the default) in production. If verification fails, the
+client raises `ConnectionError` with guidance on using `verify`.
+
+> **Note:** If `http://` URLs are used, and redirected to `https://` by the server — the
+> client follows redirects.
+
 ### Custom Client ID
 
 A `client_id` is auto-generated as a UUID and used to scope subscriptions. You can provide your own:
@@ -125,7 +232,7 @@ client = i3x.Client("https://my-i3x-server/v1", client_id="my-app-instance-1")
 ### Client
 
 ```python
-i3x.Client(base_url, auth=None, timeout=30.0, client_id=None, token=None, headers=None)
+i3x.Client(base_url, auth=None, timeout=30.0, client_id=None, token=None, headers=None, verify=True)
 ```
 
 `base_url` must include the version prefix required by the spec, e.g.
@@ -210,7 +317,7 @@ All models are frozen dataclasses.
 
 All errors inherit from `i3x.I3XError`:
 
-- `ConnectionError` — Failed to connect
+- `ConnectionError` — Failed to connect (including TLS/certificate failures)
 - `AuthenticationError` — Auth rejected (401/403)
 - `NotFoundError` — Resource not found (404)
 - `NotSupportedError` — Optional feature not supported by the server (501)
@@ -218,7 +325,8 @@ All errors inherit from `i3x.I3XError`:
 - `TimeoutError` — Request timed out
 - `SubscriptionError` — Subscription operation failed
 - `StreamError` — SSE streaming error
-- `UnsupportedVersionError` — Server runs an unsupported (pre-release) i3X version
+- `UnsupportedVersionError` — `GET /info` returned 404: a pre-release (alpha) server, or a wrong `base_url`
+- `InvalidServerResponseError` — `GET /info` responded but not with a valid i3X document (e.g. `base_url` points at a web page, login portal, or non-i3X service)
 
 ## License
 

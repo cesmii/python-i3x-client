@@ -4,7 +4,12 @@ import pytest
 import respx
 
 import i3x
-from i3x.errors import NotFoundError, NotSupportedError, UnsupportedVersionError
+from i3x.errors import (
+    InvalidServerResponseError,
+    NotFoundError,
+    NotSupportedError,
+    UnsupportedVersionError,
+)
 
 from .conftest import (
     SAMPLE_DELETE_BULK,
@@ -96,8 +101,9 @@ class TestClientVersionDetection:
         with respx.mock(base_url="http://test-server:8080") as router:
             router.get("/info").respond(status_code=404)
             c = i3x.Client("http://test-server:8080")
-            with pytest.raises(UnsupportedVersionError, match="/info"):
+            with pytest.raises(UnsupportedVersionError, match="alpha"):
                 c.connect()
+            assert c.is_connected is False
 
     @pytest.mark.parametrize("spec_version", ["1.0-beta", "0.9", "beta"])
     def test_pre_release_server_warns(self, spec_version):
@@ -111,13 +117,60 @@ class TestClientVersionDetection:
                 c.connect()
             c.disconnect()
 
-    def test_missing_spec_version_warns(self):
+    def test_beta_server_version_warns_despite_spec_1_0(self):
+        # Beta servers report specVersion "1.0" like release; only serverVersion differs.
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(json=success({
+                "specVersion": "1.0",
+                "serverVersion": "beta",
+                "capabilities": {},
+            }))
+            c = i3x.Client("http://test-server:8080")
+            with pytest.warns(DeprecationWarning, match="beta"):
+                c.connect()
+            assert c._is_beta_server is True
+            c.disconnect()
+
+    def test_orange_colors_only_for_tty(self, monkeypatch):
+        from i3x import client as client_module
+
+        class FakeStderr:
+            def __init__(self, tty): self._tty = tty
+            def isatty(self): return self._tty
+
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setattr(client_module.sys, "stderr", FakeStderr(True))
+        assert client_module._orange("hi") == "\033[38;5;208mhi\033[0m"
+
+        monkeypatch.setattr(client_module.sys, "stderr", FakeStderr(False))
+        assert client_module._orange("hi") == "hi"  # piped/redirected: no codes
+
+        monkeypatch.setattr(client_module.sys, "stderr", FakeStderr(True))
+        monkeypatch.setenv("NO_COLOR", "1")
+        assert client_module._orange("hi") == "hi"  # NO_COLOR honored
+
+    def test_release_server_version_no_warning(self, recwarn):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(json=success({
+                "specVersion": "1.0",
+                "serverVersion": "release",
+                "capabilities": {},
+            }))
+            c = i3x.Client("http://test-server:8080")
+            c.connect()
+            dep = [w for w in recwarn.list if issubclass(w.category, DeprecationWarning)]
+            assert dep == []
+            assert c._is_beta_server is False
+            c.disconnect()
+
+    def test_missing_spec_version_is_invalid(self):
+        # A JSON object with no specVersion is not identifiable as i3X.
         with respx.mock(base_url="http://test-server:8080") as router:
             router.get("/info").respond(json=success({"capabilities": {}}))
             c = i3x.Client("http://test-server:8080")
-            with pytest.warns(DeprecationWarning):
+            with pytest.raises(InvalidServerResponseError):
                 c.connect()
-            c.disconnect()
+            assert c.is_connected is False
 
     def test_v1_server_no_warning(self, mock_api, recwarn):
         c = i3x.Client("http://test-server:8080")
@@ -134,6 +187,54 @@ class TestClientVersionDetection:
         assert c.server_info.spec_version == "1.0"
         c.disconnect()
         assert c.server_info is None
+
+
+class TestClientInvalidServerResponse:
+    """A reachable endpoint that is not a valid i3X server raises a distinct
+    InvalidServerResponseError — never the alpha (UnsupportedVersionError)."""
+
+    def _expect_invalid(self, setup):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            setup(router)
+            c = i3x.Client("http://test-server:8080")
+            with pytest.raises(InvalidServerResponseError):
+                c.connect()
+            assert c.is_connected is False
+            assert c.server_info is None
+
+    def test_html_login_page(self):
+        # SSO/gateway redirect lands on an HTML page, not an alpha server.
+        self._expect_invalid(lambda r: r.get("/info").respond(
+            status_code=200, html="<!doctype html><html>login</html>"))
+
+    def test_json_with_wrong_content_type(self):
+        # Valid-looking JSON but served as text/plain (proxy/server misconfig).
+        self._expect_invalid(lambda r: r.get("/info").respond(
+            status_code=200,
+            text='{"success":true,"result":{"specVersion":"1.0"}}',
+            headers={"content-type": "text/plain"}))
+
+    def test_204_no_content(self):
+        self._expect_invalid(lambda r: r.get("/info").respond(status_code=204))
+
+    def test_empty_body_json_content_type(self):
+        # Must not crash with a JSONDecodeError.
+        self._expect_invalid(lambda r: r.get("/info").respond(
+            status_code=200, headers={"content-type": "application/json"}))
+
+    def test_bulk_envelope_unwraps_to_list(self):
+        self._expect_invalid(lambda r: r.get("/info").respond(
+            json={"success": True, "results": [{"specVersion": "1.0"}]}))
+
+    def test_non_object_json_result(self):
+        self._expect_invalid(lambda r: r.get("/info").respond(json=success(None)))
+
+    def test_message_reports_status_and_content_type(self):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(status_code=200, html="<html></html>")
+            c = i3x.Client("http://test-server:8080")
+            with pytest.raises(InvalidServerResponseError, match="text/html"):
+                c.connect()
 
 
 class TestClientServerInfo:
@@ -356,6 +457,56 @@ class TestClientUpdates:
         })
         with pytest.raises(NotSupportedError, match="history updates"):
             client.update_history("obj-1", {"value": 70.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"})
+
+
+class TestClientBetaUpdates:
+    """Beta servers route value updates to per-element PUT /objects/{id}/value."""
+
+    @pytest.fixture()
+    def beta_client(self):
+        with respx.mock(base_url="http://test-server:8080") as router:
+            router.get("/info").respond(json=success({
+                "specVersion": "1.0",
+                "serverVersion": "beta",
+                "capabilities": {},
+            }))
+            c = i3x.Client("http://test-server:8080", client_id="test-client")
+            with pytest.warns(DeprecationWarning):
+                c.connect()
+            yield c, router
+            c.disconnect()
+
+    def test_update_value_uses_per_element_endpoint(self, beta_client):
+        c, router = beta_client
+        route = router.put("/objects/obj-1/value").respond(json=success(None))
+        c.update_value("obj-1", 75.0)
+        import json
+        assert route.called
+        assert json.loads(route.calls.last.request.content) == {"value": 75.0}
+
+    def test_update_value_sends_bare_vqt(self, beta_client):
+        c, router = beta_client
+        route = router.put("/objects/obj-1/value").respond(json=success(None))
+        c.update_value("obj-1", {"value": 75.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z"})
+        import json
+        assert json.loads(route.calls.last.request.content) == {
+            "value": 75.0, "quality": "Good", "timestamp": "2026-01-01T00:00:00Z",
+        }
+
+    def test_update_value_encodes_element_id(self, beta_client):
+        c, router = beta_client
+        route = router.put("/objects/ns%3Aobj%2F1/value").respond(json=success(None))
+        c.update_value("ns:obj/1", 75.0)
+        assert route.called
+
+    def test_update_values_routes_per_element(self, beta_client):
+        c, router = beta_client
+        r1 = router.put("/objects/obj-1/value").respond(json=success(None))
+        r2 = router.put("/objects/obj-2/value").respond(json=success(None))
+        results = c.update_values({"obj-1": 75.0, "obj-2": {"value": 18.3, "quality": "Good"}})
+        assert r1.called and r2.called
+        assert [item["elementId"] for item in results] == ["obj-1", "obj-2"]
+        assert all(item["success"] for item in results)
 
 
 class TestClientSubscriptions:
